@@ -1,19 +1,36 @@
 import os
 import fitz  # PyMuPDF
-from openai import OpenAI
-import arize.phoenix as arize
-from llama_index import GPTVectorStoreIndex, SimpleDirectoryReader, QueryEngine
-from openinference.instrumentation import OpenInferenceInstrumentation
+import phoenix as px
+from phoenix.otel import register
+from llama_index.core import (
+    SimpleDirectoryReader,
+    VectorStoreIndex,
+    StorageContext,
+    load_index_from_storage,
+)
+from llama_index.core.tools import QueryEngineTool, ToolMetadata
+from llama_index.core.agent import ReActAgent
+from llama_index.llms.openai import OpenAI
+from openinference.instrumentation.llama_index import LlamaIndexInstrumentor
 
 import streamlit as st
 import numpy as np
 from dotenv import load_dotenv
 from langdetect import detect, LangDetectException
+import re
+import logging
 
 # Load environment variables
 load_dotenv()
 api_key = os.getenv("OPENAI_API_KEY")
-client = OpenAI(api_key=api_key)
+llm = OpenAI(api_key=api_key, model="gpt-4")
+
+# Configure OpenTelemetry for tracing
+tracer_provider = register()
+LlamaIndexInstrumentor().instrument(tracer_provider=tracer_provider)
+
+# Create Phoenix session
+session = px.launch_app()
 
 # Streamlit setup
 st.title("NFPA Regulation Chat Interface")
@@ -24,123 +41,134 @@ st.write(
 
 # Load PDF
 @st.cache_data
+# Load PDF
+@st.cache_data
 def load_pdf(file_path):
     doc = fitz.open(file_path)
-    text = ""
+    paragraphs = []
     for page_num, page in enumerate(doc, start=1):
-        text += f"\n\n[Page {page_num}]\n"
-        text += page.get_text(
+        text = page.get_text(
             "text",
             flags=fitz.TEXT_PRESERVE_IMAGES
             | fitz.TEXT_PRESERVE_LIGATURES
             | fitz.TEXT_PRESERVE_WHITESPACE,
         )
-    return text
+        for paragraph in text.split("\n\n"):
+            paragraphs.append({"text": paragraph, "page": page_num})
+    return paragraphs
 
 
 nfpa_text = load_pdf("NFPA-10-2022.pdf")
 st.write("PDF Loaded Successfully.")
 
+
 # Split PDF into paragraphs for more granularity, while excluding non-English text
-import re
-
-
 def split_pdf_into_paragraphs(text):
     paragraphs = text.split("\n\n")
     english_paragraphs = []
     for p in paragraphs:
         try:
             if detect(p) == "en":
-                english_paragraphs.append(p)
+                # Adding metadata with section numbers if available
+                section_match = re.match(r"^(\d+(\.\d+)*)", p)
+                if section_match:
+                    section = section_match.group(0)
+                    english_paragraphs.append({"text": p, "section": section})
+                else:
+                    english_paragraphs.append({"text": p, "section": None})
         except LangDetectException:
             continue
     return english_paragraphs
 
 
-paragraphs = split_pdf_into_paragraphs(nfpa_text)
+paragraphs = nfpa_text
 
 
 # Pre-process the paragraphs to remove irrelevant information and clean the text
+# Pre-process the paragraphs to remove irrelevant information and clean the text
 def preprocess_paragraphs(paragraphs):
     cleaned_paragraphs = []
-    for paragraph in paragraphs:
+    for paragraph_dict in paragraphs:
+        paragraph = paragraph_dict["text"]
         paragraph = re.sub(r"\s+", " ", paragraph)  # Remove extra whitespace
         paragraph = paragraph.strip()  # Remove leading/trailing whitespace
-        if len(paragraph) > 20:  # Keep only paragraphs with substantial content
+        if len(paragraph) > 20:  # Keep paragraphs that are long enough to be useful
             cleaned_paragraphs.append(paragraph)
     return cleaned_paragraphs
 
 
-paragraphs = preprocess_paragraphs(paragraphs)
+cleaned_paragraphs = preprocess_paragraphs(paragraphs)
 
 
-# Create and index the NFPA document using LlamaIndex
+# Load or build the index
 @st.cache_data
-def create_llama_index(paragraphs):
-    reader = SimpleDirectoryReader(input_text=paragraphs)
-    index = GPTVectorStoreIndex.from_documents(reader.load_data())
-    return index
+def load_or_build_index(paragraphs):
+    try:
+        storage_context = StorageContext.from_defaults(persist_dir="./storage/nfpa")
+        nfpa_index = load_index_from_storage(storage_context)
+        index_loaded = True
+    except:
+        index_loaded = False
+
+    if not index_loaded:
+        from llama_index.core import Document
+
+        logging.info(f"Total paragraphs to index: {len(paragraphs)}")
+        nfpa_docs = [
+            Document(text=p["text"], metadata={"page": p["page"]}) for p in paragraphs
+        ]
+        nfpa_index = VectorStoreIndex.from_documents(nfpa_docs, show_progress=True)
+        nfpa_index.storage_context.persist(persist_dir="./storage/nfpa")
+
+    return nfpa_index
 
 
-index = create_llama_index(paragraphs)
+nfpa_index = load_or_build_index(cleaned_paragraphs)
 
-# Setup Query Engine with LlamaIndex
-query_engine = QueryEngine(index=index)
+# Setting up the query engine
+nfpa_engine = nfpa_index.as_query_engine(similarity_top_k=5, llm=llm)
 
-
-# Define a retrieval function using LlamaIndex
-@st.cache_data
-def retrieve_relevant_context(query, query_engine, top_n=3):
-    response = query_engine.query(query, top_k=top_n)
-    results = [(item.text, item.metadata.get("page", "unknown")) for item in response]
-    return results
-
-
-# Setup Arize Phoenix for monitoring
-arize.init(project_name="NFPA_Chat_App", api_key=api_key)
-
-# Setup openinference instrumentation
-instrumentation = OpenInferenceInstrumentation()
-
-
-# Function to ask OpenAI for more detailed answers
-def ask_openai(api_key, question, context_with_indices):
-    # Concatenate top paragraphs to create context (while limiting token size)
-    combined_context = "\n".join(
-        [f"{context} (from Page {index})" for context, index in context_with_indices]
+# Define query engine tools
+query_engine_tools = [
+    QueryEngineTool(
+        query_engine=nfpa_engine,
+        metadata=ToolMetadata(
+            name="NFPA",
+            description=(
+                "Provides information about Fire regulations for year 2022. "
+                "Use a detailed plain text question as input to the tool. "
+            ),
+        ),
     )
-    if len(combined_context) > 1500:  # Ensure that context isn't too long
-        combined_context = combined_context[:1500] + "..."
+]
 
-    messages = [
-        {
-            "role": "system",
-            "content": "You are an assistant helping with NFPA regulations. Only provide information that directly references the handbook, including the exact quote and the page number. If the information is not found in the provided context, respond that it is not available.",
-        },
-        {
-            "role": "user",
-            "content": f"Use the following NFPA regulations to answer the question:\n\n{combined_context}\n\nQuestion: {question}",
-        },
-    ]
-    response = client.chat.completions.create(
-        model="gpt-3.5-turbo", messages=messages, max_tokens=150, temperature=0.2
-    )
-    return response.choices[0].message.content.strip()
+# Creating the Agent
+agent = ReActAgent.from_tools(
+    query_engine_tools,
+    llm=llm,
+    verbose=True,
+    max_turns=10,
+)
 
+# Streamlit Input for Querying
+user_query = st.text_input("Ask about NFPA regulations:")
+if user_query:
+    # Pre-process query to handle section-specific requests
+    section_ref = re.findall(r"\d+(\.\d+)*", user_query)
+    if section_ref:
+        user_query += f" Please look specifically at section {section_ref[0]} for this information."
+    response = agent.chat(user_query)
+    # Extracting exact quotes and page numbers from the response
+    if response.source_nodes:
+        for node in response.source_nodes:
+            if node.node and "page" in node.node.extra_info:
+                st.write(
+                    f"Exact quote from page {node.node.extra_info['page']}: {node.node.text}"
+                )
+    st.write(response)
 
-# Integrate with Streamlit
-query = st.text_input("Ask a question about NFPA regulations:")
-if query:
-    # Retrieve context using LlamaIndex
-    relevant_paragraphs_with_indices = retrieve_relevant_context(query, query_engine)
-    if relevant_paragraphs_with_indices:
-        # Instrumentation start for monitoring
-        instrumentation.start()
-        answer = ask_openai(api_key, query, relevant_paragraphs_with_indices)
-        # Instrumentation end for monitoring
-        instrumentation.end()
-        st.write(f"**Answer:** {answer}")
-        # Log to Arize for monitoring purposes
-        arize.log_response(query, answer, relevant_paragraphs_with_indices)
-    else:
-        st.write("I don't know because it's not in the handbook.")
+# Track session interactions
+logging.basicConfig(level=logging.INFO)
+logging.info(
+    f"User query: {user_query}, Response: {str(response) if user_query else ''}"
+)
