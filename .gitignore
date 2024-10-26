@@ -2,3 +2,8 @@
 .python-version
 storage/
 new-nfpa/
+
+env/
+.env
+__pycache__/
+*.pyc
