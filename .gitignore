@@ -1,2 +1,4 @@
 .env
 .python-version
+storage/
+new-nfpa/
