@@ -1,12 +1,13 @@
 import os
 import fitz  # PyMuPDF
 from openai import OpenAI
+import arize.phoenix as arize
+from llama_index import GPTVectorStoreIndex, SimpleDirectoryReader, QueryEngine
+from openinference.instrumentation import OpenInferenceInstrumentation
 
 import streamlit as st
 import numpy as np
 from dotenv import load_dotenv
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 from langdetect import detect, LangDetectException
 
 # Load environment variables
@@ -72,31 +73,41 @@ def preprocess_paragraphs(paragraphs):
 
 paragraphs = preprocess_paragraphs(paragraphs)
 
-# Create TF-IDF Vectorizer and fit to the cleaned paragraphs of the PDF
-vectorizer = TfidfVectorizer(stop_words="english").fit(paragraphs)
+
+# Create and index the NFPA document using LlamaIndex
+@st.cache_data
+def create_llama_index(paragraphs):
+    reader = SimpleDirectoryReader(input_text=paragraphs)
+    index = GPTVectorStoreIndex.from_documents(reader.load_data())
+    return index
 
 
-# Define a retrieval function that finds the top matching paragraphs
-def retrieve_relevant_paragraphs(query, paragraphs, vectorizer, top_n=3):
-    query_vec = vectorizer.transform([query])
-    paragraph_vecs = vectorizer.transform(paragraphs)
-    similarity_scores = cosine_similarity(query_vec, paragraph_vecs).flatten()
-    top_indices = similarity_scores.argsort()[-top_n:][::-1]
+index = create_llama_index(paragraphs)
 
-    top_paragraphs = [
-        (paragraphs[i], i) for i in top_indices if similarity_scores[i] > 0.1
-    ]  # Filter to ensure relevance
-    return top_paragraphs
+# Setup Query Engine with LlamaIndex
+query_engine = QueryEngine(index=index)
+
+
+# Define a retrieval function using LlamaIndex
+@st.cache_data
+def retrieve_relevant_context(query, query_engine, top_n=3):
+    response = query_engine.query(query, top_k=top_n)
+    results = [(item.text, item.metadata.get("page", "unknown")) for item in response]
+    return results
+
+
+# Setup Arize Phoenix for monitoring
+arize.init(project_name="NFPA_Chat_App", api_key=api_key)
+
+# Setup openinference instrumentation
+instrumentation = OpenInferenceInstrumentation()
 
 
 # Function to ask OpenAI for more detailed answers
 def ask_openai(api_key, question, context_with_indices):
     # Concatenate top paragraphs to create context (while limiting token size)
     combined_context = "\n".join(
-        [
-            f"{context} (from Page {index + 1})"
-            for context, index in context_with_indices
-        ]
+        [f"{context} (from Page {index})" for context, index in context_with_indices]
     )
     if len(combined_context) > 1500:  # Ensure that context isn't too long
         combined_context = combined_context[:1500] + "..."
@@ -120,11 +131,16 @@ def ask_openai(api_key, question, context_with_indices):
 # Integrate with Streamlit
 query = st.text_input("Ask a question about NFPA regulations:")
 if query:
-    relevant_paragraphs_with_indices = retrieve_relevant_paragraphs(
-        query, paragraphs, vectorizer
-    )
+    # Retrieve context using LlamaIndex
+    relevant_paragraphs_with_indices = retrieve_relevant_context(query, query_engine)
     if relevant_paragraphs_with_indices:
+        # Instrumentation start for monitoring
+        instrumentation.start()
         answer = ask_openai(api_key, query, relevant_paragraphs_with_indices)
+        # Instrumentation end for monitoring
+        instrumentation.end()
         st.write(f"**Answer:** {answer}")
+        # Log to Arize for monitoring purposes
+        arize.log_response(query, answer, relevant_paragraphs_with_indices)
     else:
         st.write("I don't know because it's not in the handbook.")

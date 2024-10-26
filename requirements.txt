@@ -1,6 +1,12 @@
 streamlit
-PyMuPDF  # For PDF parsing
-openai   # For using GPT-based models
-python-dotenv   # For environment variable management
-scikit-learn
+openai
+PyMuPDF
+arize-phoenix
+llama-index
+openinference-instrumentation-llama-index
+python-dotenv
 langdetect
+scikit-learn
+numpy
+requests
+llama_index
