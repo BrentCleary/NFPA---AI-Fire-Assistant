@@ -3,3 +3,4 @@ PyMuPDF  # For PDF parsing
 openai   # For using GPT-based models
 python-dotenv   # For environment variable management
 scikit-learn
+langdetect
